@@ -2,120 +2,118 @@ import os
 import time
 import requests
 import feedparser
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
-def env(name, default=None, required=False):
-    v = os.getenv(name, default)
-    if required and (v is None or str(v).strip() == ""):
-        raise RuntimeError(f"Falta variável de ambiente: {name}")
-    return v
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+FEED_URL = os.getenv("FEED_URL")
 
-TELEGRAM_TOKEN = env("TELEGRAM_TOKEN", required=True)
-CHAT_ID = env("CHAT_ID", required=True)
-AFFILIATE_ID = env("AFFILIATE_ID", required=True)  # ex: dionatanrenzz
-FEED_URL = env("FEED_URL", required=True)          # link do RSS gerado
-INTERVAL_SECONDS = int(env("INTERVAL_SECONDS", "300"))
+LAST_LINK_FILE = "last_link.txt"
 
 def log(msg):
     print(msg, flush=True)
 
-def send_telegram(text):
+def enviar_telegram(mensagem):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
-        "text": text,
+        "text": mensagem,
         "disable_web_page_preview": False
     }
-    r = requests.post(url, data=payload, timeout=30)
+    r = requests.post(url, data=payload, timeout=20)
     log(f"[telegram] status={r.status_code} resp={r.text[:200]}")
-    r.raise_for_status()
+    return r.status_code == 200
 
-def add_affiliate(link: str) -> str:
-    """
-    Adiciona matt_word=AFFILIATE_ID no link.
-    Se já existir matt_word, substitui.
-    """
+def carregar_ultimo_link():
     try:
-        p = urlparse(link)
-        q = dict(parse_qsl(p.query, keep_blank_values=True))
-        q["matt_word"] = AFFILIATE_ID
-        new_query = urlencode(q, doseq=True)
-        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
-    except Exception:
-        # se der qualquer problema de parse, devolve o link original
-        return link
+        with open(LAST_LINK_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+    except Exception as e:
+        log(f"[last_link] erro lendo arquivo: {e}")
+        return ""
 
-def fetch_feed():
-    # Alguns feeds bloqueiam user-agent "genérico"
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; PromotopBot/1.0)"}
-    r = requests.get(FEED_URL, headers=headers, timeout=30)
-    log(f"[rss] status={r.status_code}")
-    r.raise_for_status()
-    feed = feedparser.parse(r.text)
-    return feed.entries or []
+def salvar_ultimo_link(link):
+    try:
+        with open(LAST_LINK_FILE, "w", encoding="utf-8") as f:
+            f.write(link)
+    except Exception as e:
+        log(f"[last_link] erro salvando arquivo: {e}")
 
-def format_item(entry):
-    title = (entry.get("title") or "").strip()
-    link = (entry.get("link") or "").strip()
-    if link:
-        link = add_affiliate(link)
+def validar_variaveis():
+    faltando = []
+    if not TELEGRAM_TOKEN:
+        faltando.append("TELEGRAM_TOKEN")
+    if not CHAT_ID:
+        faltando.append("CHAT_ID")
+    if not FEED_URL:
+        faltando.append("FEED_URL")
 
-    # tenta pegar preço se o feed tiver (alguns geradores colocam em summary)
-    summary = (entry.get("summary") or "").strip()
+    if faltando:
+        log("❌ Faltando variáveis de ambiente: " + ", ".join(faltando))
+        log("➡️ Vá em Render > Environment e crie essas variáveis.")
+        return False
 
-    msg = f"🔥 OFERTA NOVA\n\n📌 {title}\n\n🔗 {link}"
-    if summary and summary.lower() not in title.lower():
-        # evita mandar summary gigante
-        s = summary.replace("\n", " ").strip()
-        if len(s) > 180:
-            s = s[:180] + "..."
-        msg += f"\n\n📝 {s}"
-    return msg
+    return True
 
-def entry_id(entry):
-    # alguns feeds usam id/guid, outros usam link
-    return (entry.get("id") or entry.get("guid") or entry.get("link") or entry.get("title") or "").strip()
+def buscar_oferta_rss():
+    feed = feedparser.parse(FEED_URL)
+
+    # feed.bozo == 1 geralmente significa que teve warning/erro ao parsear
+    log(f"[rss] bozo={feed.bozo} entries={len(feed.entries) if feed.entries else 0}")
+
+    if not feed.entries:
+        return None
+
+    item = feed.entries[0]
+    titulo = getattr(item, "title", "Oferta do Mercado Livre")
+    link = getattr(item, "link", "")
+
+    if not link:
+        return None
+
+    msg = (
+        "🔥 OFERTA MERCADO LIVRE (RSS) 🔥\n\n"
+        f"{titulo}\n\n"
+        f"👉 {link}"
+    )
+    return link, msg
 
 def main():
-    log("🤖 Bot RSS iniciado com sucesso")
-    send_telegram("✅ Bot RSS online. Vou monitorar o feed e avisar quando surgir item novo.")
+    log("🤖 Iniciando bot RSS...")
 
-    seen = set()
-    warmup = True
+    if not validar_variaveis():
+        # não fica reiniciando e dando erro toda hora
+        time.sleep(3600)
+        return
+
+    # Mensagem de teste ao iniciar
+    enviar_telegram("✅ Bot RSS ligado no Render! Vou postar ofertas quando aparecerem no feed.")
+
+    ultimo_link = carregar_ultimo_link()
+    log(f"[last_link] carregado: {ultimo_link[:80]}")
 
     while True:
         try:
-            entries = fetch_feed()
-            if not entries:
-                log("Nenhum item no feed agora.")
-            else:
-                # processa do mais antigo pro mais novo
-                new_count = 0
-                for e in reversed(entries[:20]):  # limita pra não explodir
-                    eid = entry_id(e)
-                    if not eid:
-                        continue
-                    if eid in seen:
-                        continue
+            resultado = buscar_oferta_rss()
+            if resultado:
+                link, msg = resultado
 
-                    seen.add(eid)
-                    if warmup:
-                        # na primeira rodada, só “aprende” os itens existentes
-                        continue
+                if link != ultimo_link:
+                    ok = enviar_telegram(msg)
+                    if ok:
+                        ultimo_link = link
+                        salvar_ultimo_link(link)
+                        log("[rss] ✅ nova oferta enviada")
+                else:
+                    log("[rss] mesma oferta, não enviei")
 
-                    msg = format_item(e)
-                    send_telegram(msg)
-                    new_count += 1
+            log("⏳ Dormindo 300s...")
+            time.sleep(300)
 
-                log(f"Itens novos enviados: {new_count}")
-
-            warmup = False
-            log(f"⏳ Dormindo {INTERVAL_SECONDS}s...")
-            time.sleep(INTERVAL_SECONDS)
-
-        except Exception as ex:
-            log(f"❌ ERRO: {ex}")
-            time.sleep(30)
+        except Exception as e:
+            log(f"❌ ERRO no loop: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
