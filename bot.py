@@ -2,163 +2,163 @@ import os
 import time
 import requests
 
-# ====== Variáveis de ambiente (Render) ======
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()
-AFFILIATE_ID = os.getenv("AFFILIATE_ID", "").strip()
+# --------- ENV VARS (Render) ----------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+AFFILIATE_ID = os.getenv("AFFILIATE_ID", "promotop1")
 
-# ====== Configurações ======
-INTERVALO_SEGUNDOS = 300  # 5 minutos
-CATEGORIA = "MLB1055"     # Ex.: Eletrônicos (você pode trocar depois)
-LIMIT = 1
+ML_CLIENT_ID = os.getenv("ML_CLIENT_ID")
+ML_CLIENT_SECRET = os.getenv("ML_CLIENT_SECRET")
+ML_REDIRECT_URI = os.getenv("ML_REDIRECT_URI", "https://example.com")
+ML_REFRESH_TOKEN = os.getenv("ML_REFRESH_TOKEN")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json,text/plain,*/*",
-    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
-    "Connection": "keep-alive",
-}
+# --------- BASIC VALIDATION ----------
+def require_env(name, value):
+    if not value:
+        raise RuntimeError(f"Falta variável de ambiente: {name}")
 
-# Guarda último item enviado para não repetir
-ultimo_id_enviado = None
+require_env("TELEGRAM_TOKEN", TELEGRAM_TOKEN)
+require_env("CHAT_ID", CHAT_ID)
+require_env("AFFILIATE_ID", AFFILIATE_ID)
+require_env("ML_CLIENT_ID", ML_CLIENT_ID)
+require_env("ML_CLIENT_SECRET", ML_CLIENT_SECRET)
+require_env("ML_REFRESH_TOKEN", ML_REFRESH_TOKEN)
 
-
-def log(msg: str):
+# --------- LOG ----------
+def log(msg):
     print(msg, flush=True)
 
-
-def validar_env():
-    ok = True
-    if not TELEGRAM_TOKEN:
-        log("❌ Faltando TELEGRAM_TOKEN nas Environment Variables do Render")
-        ok = False
-    if not CHAT_ID:
-        log("❌ Faltando CHAT_ID nas Environment Variables do Render")
-        ok = False
-    if not AFFILIATE_ID:
-        log("❌ Faltando AFFILIATE_ID nas Environment Variables do Render")
-        ok = False
-    return ok
-
-
-def enviar_telegram(texto: str) -> bool:
+# --------- TELEGRAM ----------
+def telegram_send(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    r = requests.post(url, data={"chat_id": CHAT_ID, "text": text})
+    log(f"[telegram] status={r.status_code} resp={r.text[:200]}")
+    return r.status_code == 200
+
+# --------- ML TOKEN (refresh) ----------
+_access_token = None
+_access_token_exp = 0  # unix time
+
+def ml_refresh_access_token():
+    global _access_token, _access_token_exp, ML_REFRESH_TOKEN
+
+    url = "https://api.mercadolibre.com/oauth/token"
     data = {
-        "chat_id": CHAT_ID,
-        "text": texto,
-        "disable_web_page_preview": False
+        "grant_type": "refresh_token",
+        "client_id": ML_CLIENT_ID,
+        "client_secret": ML_CLIENT_SECRET,
+        "refresh_token": ML_REFRESH_TOKEN,
     }
 
-    try:
-        r = requests.post(url, data=data, timeout=25)
-        log(f"[telegram] status={r.status_code} resp={r.text[:200]}")
-        return r.status_code == 200
-    except Exception as e:
-        log(f"[telegram] ERRO: {e}")
-        return False
+    r = requests.post(url, data=data, timeout=30)
+    log(f"[ml-token] status={r.status_code} resp={r.text[:200]}")
 
+    r.raise_for_status()
+    j = r.json()
 
-def montar_link_afiliado(permalink: str) -> str:
-    # Se não tiver AFFILIATE_ID, manda link normal
-    if not AFFILIATE_ID:
-        return permalink
+    _access_token = j.get("access_token")
+    expires_in = int(j.get("expires_in", 0))
+    # renova um pouco antes de expirar
+    _access_token_exp = int(time.time()) + max(expires_in - 60, 60)
 
-    # Adiciona matt_word corretamente (com ? ou &)
-    sep = "&" if "?" in permalink else "?"
-    return f"{permalink}{sep}matt_word={AFFILIATE_ID}"
+    # às vezes o ML devolve refresh_token novo
+    new_refresh = j.get("refresh_token")
+    if new_refresh and new_refresh != ML_REFRESH_TOKEN:
+        ML_REFRESH_TOKEN = new_refresh
+        log("[ml-token] Refresh token foi atualizado (salve no Render se quiser).")
 
+    return _access_token
+
+def ml_get_access_token():
+    global _access_token, _access_token_exp
+    now = int(time.time())
+    if (not _access_token) or (now >= _access_token_exp):
+        return ml_refresh_access_token()
+    return _access_token
+
+# --------- ML SEARCH ----------
+# Você pode trocar categoria e termo abaixo:
+CATEGORY_ID = "MLB1055"   # Eletrônicos
+QUERY = None             # ex: "iphone", ou deixe None
+
+_last_sent_ids = set()
 
 def buscar_oferta():
-    """
-    Busca 1 item da categoria (ordenado por preço asc).
-    Retorna dict com info da oferta ou None.
-    """
+    token = ml_get_access_token()
+
     url = "https://api.mercadolibre.com/sites/MLB/search"
     params = {
-        "category": CATEGORIA,
+        "category": CATEGORY_ID,
         "sort": "price_asc",
-        "limit": LIMIT
+        "limit": 5
+    }
+    if QUERY:
+        params["q"] = QUERY
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
     }
 
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=25)
-        log(f"[ml] status={r.status_code}")
-
-        # Se Mercado Livre bloquear (403) ou der erro, não derruba o bot
-        if r.status_code != 200:
-            log(f"[ml] resposta curta: {r.text[:200]}")
-            return None
-
-        data = r.json()
-        results = data.get("results", [])
-        if not results:
-            return None
-
-        p = results[0]
-        item_id = p.get("id")
-        title = p.get("title", "Sem título")
-        price = p.get("price", "N/A")
-        permalink = p.get("permalink", "")
-
-        link = montar_link_afiliado(permalink)
-
-        return {
-            "id": item_id,
-            "title": title,
-            "price": price,
-            "link": link
-        }
-
-    except Exception as e:
-        log(f"[ml] ERRO: {e}")
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    log(f"[ml] status={r.status_code}")
+    if r.status_code != 200:
+        log(f"[ml] resp={r.text[:200]}")
         return None
 
+    data = r.json()
+    results = data.get("results", [])
+    if not results:
+        return None
 
-def formatar_mensagem(oferta: dict) -> str:
-    return (
-        "🔥 OFERTA MERCADO LIVRE\n\n"
-        f"📦 {oferta['title']}\n"
-        f"💰 R$ {oferta['price']}\n\n"
-        f"👉 {oferta['link']}"
-    )
+    # pega o primeiro item que ainda não foi enviado
+    for p in results:
+        pid = p.get("id")
+        if not pid or pid in _last_sent_ids:
+            continue
 
+        title = p.get("title", "Sem título")
+        price = p.get("price", "")
+        permalink = p.get("permalink", "")
 
+        # link afiliado (matt_word)
+        if "?" in permalink:
+            link = f"{permalink}&matt_word={AFFILIATE_ID}"
+        else:
+            link = f"{permalink}?matt_word={AFFILIATE_ID}"
+
+        msg = (
+            f"🔥 OFERTA MERCADO LIVRE\n\n"
+            f"📌 {title}\n"
+            f"💰 R$ {price}\n\n"
+            f"👉 {link}"
+        )
+
+        _last_sent_ids.add(pid)
+        # limita memória
+        if len(_last_sent_ids) > 200:
+            _last_sent_ids.clear()
+
+        return msg
+
+    return None
+
+# --------- MAIN LOOP ----------
 def main():
-    global ultimo_id_enviado
-
-    log("✅ Bot iniciado com sucesso")
-
-    if not validar_env():
-        # Não adianta rodar se faltou env
-        log("❌ Corrija as Environment Variables e faça Deploy novamente.")
-        return
-
-    # Mensagem de teste (você disse que chegou — ótimo)
-    enviar_telegram("✅ Bot online no Render! (mensagem de teste)")
+    telegram_send("✅ Bot iniciado e conectado. (teste)")
 
     while True:
         try:
             oferta = buscar_oferta()
-
-            if oferta is None:
-                log("Nenhuma oferta encontrada (ou ML bloqueou).")
+            if oferta:
+                telegram_send(oferta)
             else:
-                # Evita repetir o mesmo produto sempre
-                if oferta["id"] != ultimo_id_enviado:
-                    msg = formatar_mensagem(oferta)
-                    enviado = enviar_telegram(msg)
-                    if enviado:
-                        ultimo_id_enviado = oferta["id"]
-                else:
-                    log("Oferta repetida (mesmo ID). Não enviei de novo.")
-
-            log(f"⏳ Dormindo {INTERVALO_SEGUNDOS}s...")
-            time.sleep(INTERVALO_SEGUNDOS)
-
+                log("Nenhuma oferta encontrada")
+            log("⏳ Dormindo 300s...")
+            time.sleep(300)  # 5 minutos
         except Exception as e:
             log(f"❌ ERRO no loop: {e}")
             time.sleep(30)
-
 
 if __name__ == "__main__":
     main()
